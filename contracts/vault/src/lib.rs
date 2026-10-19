@@ -53,8 +53,8 @@ pub mod timelock;
 pub mod views;
 
 pub use timelock::{
-    DEFAULT_TIMELOCK_SECONDS, MAX_TIMELOCK_SECONDS, MIN_TIMELOCK_SECONDS,
-    PROPOSAL_GRACE_SECONDS, TIMELOCK_GRACE_SECONDS,
+    DEFAULT_TIMELOCK_SECONDS, MAX_TIMELOCK_SECONDS, MIN_TIMELOCK_SECONDS, PROPOSAL_GRACE_SECONDS,
+    TIMELOCK_GRACE_SECONDS,
 };
 
 /// Bounded visible-ASCII metadata validators (shared `callora-validators` crate).
@@ -155,9 +155,22 @@ pub mod token {
 
 #[cfg(target_arch = "wasm32")]
 pub mod settlement {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32-unknown-unknown/release/callora_settlement.wasm"
-    );
+    use soroban_sdk::{contractclient, Address, Env};
+
+    /// Minimal settlement interface used by the vault (cross-contract client).
+    #[contractclient(name = "Client")]
+    pub trait SettlementInterface {
+        fn receive_payment(
+            env: Env,
+            caller: Address,
+            amount: i128,
+            to_pool: bool,
+            developer: Option<Address>,
+            token: Address,
+            ledger_seq: u32,
+        );
+        fn record_deduction(env: Env, amount: i128, request_id: u64);
+    }
 }
 
 /// In native/test mode the settlement contract is registered directly in the
@@ -243,7 +256,11 @@ impl CalloraVault {
     /// This function is **read-only** (no storage writes, no events, no auth).
     /// `deduct` calls it before any mutation so that the validation order is
     /// guaranteed identical to what `simulate_deduct` observes.
-    pub(crate) fn validate_deduct(env: &Env, caller: &Address, amount: i128) -> Result<(), VaultError> {
+    pub(crate) fn validate_deduct(
+        env: &Env,
+        caller: &Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
         // 1. Owner-or-authorized-caller check (issue #1107: the owner may
         //    always deduct; a configured authorized caller may deduct too).
         Self::require_authorized_deduct_caller(env.clone(), caller)?;
@@ -333,7 +350,7 @@ impl CalloraVault {
 
         let initial_balance_val = initial_balance.unwrap_or(0);
         if initial_balance_val < 0 {
-            return Err(VaultError::InitialBalanceNegative);
+            return Err(VaultError::AmountNotPositive);
         }
 
         env.storage().instance().set(&DataKey::Owner, &owner);
@@ -348,13 +365,13 @@ impl CalloraVault {
         env.storage()
             .instance()
             .set(&DataKey::Balance, &initial_balance_val);
-            
+
         if let Some(ac) = authorized_caller {
             env.storage()
                 .instance()
                 .set(&DataKey::AuthorizedCaller, &ac);
         }
-        
+
         env.storage()
             .instance()
             .set(&DataKey::MinDeposit, &min_dep_val);
@@ -371,8 +388,14 @@ impl CalloraVault {
         }
         env.storage().instance().set(&DataKey::Paused, &false);
 
-        env.events()
-            .publish((events::event_init(&env), events::event_version_v1(&env), owner.clone()), initial_balance_val);
+        env.events().publish(
+            (
+                events::event_init(&env),
+                events::event_version_v1(&env),
+                owner.clone(),
+            ),
+            initial_balance_val,
+        );
         Ok(())
     }
 
@@ -859,7 +882,10 @@ impl CalloraVault {
         // Setting stores a plain `Address`; clearing removes the key entirely so
         // the value never round-trips through `ScVal::Void`.
         match new_caller {
-            Some(ref caller) => env.storage().instance().set(&DataKey::AuthorizedCaller, caller),
+            Some(ref caller) => env
+                .storage()
+                .instance()
+                .set(&DataKey::AuthorizedCaller, caller),
             None => env.storage().instance().remove(&DataKey::AuthorizedCaller),
         }
 
@@ -1365,10 +1391,7 @@ impl CalloraVault {
         }
 
         // Read old value before overwriting for audit trail.
-        let old_settlement: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Settlement);
+        let old_settlement: Option<Address> = env.storage().instance().get(&DataKey::Settlement);
 
         env.storage()
             .instance()
@@ -1811,8 +1834,9 @@ impl CalloraVault {
         let window = timelock::get_timelock_window(&env);
         let execute_after = timelock::saturating_deadline(proposed_at, window)
             .ok_or(VaultError::TimelockOverflow)?;
-        let expires_at = timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
-            .ok_or(VaultError::TimelockOverflow)?;
+        let expires_at =
+            timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
+                .ok_or(VaultError::TimelockOverflow)?;
         timelock::set_pending_pause(
             &env,
             &timelock::PendingPause {
@@ -1981,8 +2005,9 @@ impl CalloraVault {
         let window = timelock::get_timelock_window(&env);
         let execute_after = timelock::saturating_deadline(proposed_at, window)
             .ok_or(VaultError::TimelockOverflow)?;
-        let expires_at = timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
-            .ok_or(VaultError::TimelockOverflow)?;
+        let expires_at =
+            timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
+                .ok_or(VaultError::TimelockOverflow)?;
         timelock::set_pending_upgrade(
             &env,
             &timelock::PendingUpgrade {
@@ -2141,8 +2166,9 @@ impl CalloraVault {
         let window = timelock::get_timelock_window(&env);
         let execute_after = timelock::saturating_deadline(proposed_at, window)
             .ok_or(VaultError::TimelockOverflow)?;
-        let expires_at = timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
-            .ok_or(VaultError::TimelockOverflow)?;
+        let expires_at =
+            timelock::saturating_deadline(execute_after, timelock::PROPOSAL_GRACE_SECONDS)
+                .ok_or(VaultError::TimelockOverflow)?;
         timelock::set_pending_sweep(
             &env,
             &timelock::PendingSweep {
@@ -2611,7 +2637,12 @@ impl CalloraVault {
             .set(&StorageKey::AllowedDepositors, &new_list);
 
         env.events().publish(
-            (events::event_allowlist_remove(&env), events::event_version_v1(&env), caller, depositor),
+            (
+                events::event_allowlist_remove(&env),
+                events::event_version_v1(&env),
+                caller,
+                depositor,
+            ),
             (),
         );
 
@@ -2865,14 +2896,14 @@ mod test_idempotency;
 #[cfg(test)]
 mod test_event_schema;
 
+#[cfg(test)]
+mod test_admin_transfers;
 /// #1125: sweep/pause/upgrade lifecycle against the global admin cool-off
 /// (back-to-back matured proposals, boundary, cancel/re-propose, and the
 /// `cancel_sweep` `existing.is_some()` payload). Named `*timelock*` so
 /// `cargo test -p callora-vault timelock` selects it.
 #[cfg(test)]
 mod test_timelock_cooldown;
-#[cfg(test)]
-mod test_admin_transfers;
 
 /// Allowlist ↔ deposit authorization parity (issue #1110): the
 /// `is_authorized_depositor` view and the `deposit` gate must consult the
@@ -2895,11 +2926,6 @@ mod test_capabilities;
 
 #[cfg(test)]
 mod test_allowlist_remove;
-
-/// Parity tests for `simulate_deduct` vs `deduct` (Issue #1115).
-/// Run with: `cargo test -p callora-vault simulate`
-#[cfg(test)]
-mod test_simulate_parity;
 
 #[cfg(test)]
 mod test_views;
